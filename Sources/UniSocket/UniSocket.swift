@@ -89,7 +89,7 @@ public class UniSocket {
 		memset(peer_addrinfo, 0, MemoryLayout<addrinfo>.size)
 		if type == .local {
 			peer_local.sun_family = sa_family_t(AF_UNIX)
-			_ = withUnsafeMutablePointer(to: &peer_local.sun_path.0) { ptr in
+			withUnsafeMutablePointer(to: &peer_local.sun_path.0) { ptr in
 				_ = peer.withCString {
 					strcpy(ptr, $0)
 				}
@@ -160,8 +160,8 @@ public class UniSocket {
 		let index = Int(fd) / fdmask_bits
 		let bit = Int(fd) % fdmask_bits
 		var mask: fdmask = 1 << bit
-		_ = withUnsafePointer(to: &mask) { src in
-			_ = withUnsafeMutablePointer(to: &fdset) { dst in
+		withUnsafePointer(to: &mask) { src in
+			withUnsafeMutablePointer(to: &fdset) { dst in
 				memset(dst, 0, MemoryLayout<fd_set>.size)
 				memcpy(dst + (index * fdmask_size), src, fdmask_size)
 			}
