@@ -1,9 +1,12 @@
-// swift-tools-version:5.2
+// swift-tools-version:5.8
 
 import PackageDescription
 
 let package = Package(
 	name: "UniSocket",
+  // platforms: [.macOS(.v10_15)],
+  platforms: [.macOS(.v13)],
+
 	products: [
 		.library(name: "UniSocket", targets: ["UniSocket"])
 	],
@@ -13,6 +16,6 @@ let package = Package(
 	targets: [
 		.target(name: "UniSocket"),
 		.testTarget(name: "UniSocketTests", dependencies: ["UniSocket", "DNS"])
-	],
-	swiftLanguageVersions: [.v5]
+	]
+	// swiftLanguageVersions: [.v5]
 )

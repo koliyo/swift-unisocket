@@ -22,6 +22,9 @@ import Foundation
 #if os(macOS) || os(iOS) || os(tvOS)
 import Darwin
 private let system_socket = Darwin.socket
+private let system_bind = Darwin.bind
+private let system_listen = Darwin.listen
+private let system_accept = Darwin.accept
 private let system_connect = Darwin.connect
 private let system_close = Darwin.close
 private let system_recv = Darwin.recv
@@ -31,6 +34,9 @@ typealias fdmask = Int32
 #elseif os(Linux)
 import Glibc
 private let system_socket = Glibc.socket
+private let system_bind = Glibc.bind
+private let system_listen = Glibc.listen
+private let system_accept = Glibc.accept
 private let system_connect = Glibc.connect
 private let system_close = Glibc.close
 private let system_recv = Glibc.recv
@@ -58,7 +64,7 @@ public enum UniSocketStatus: String {
 	case writable
 }
 
-public typealias UniSocketTimeout = (connect: UInt, read: UInt, write: UInt)
+public typealias UniSocketTimeout = (connect: UInt?, read: UInt?, write: UInt?)
 
 public class UniSocket {
 
@@ -168,6 +174,138 @@ public class UniSocket {
 		}
 	}
 
+  ///
+	/// Private function to return the last error based on the value of errno.
+	///
+	/// - Returns: String containing relevant text about the error.
+	///
+	private func lastError() -> String {
+
+		return String(validatingUTF8: strerror(errno)) ?? "Error: \(errno)"
+	}
+
+
+
+  public func accept() throws -> UniSocket {
+
+		// The socket must've been created, not connected and listening...
+		if fd == -1 {
+
+			throw UniSocketError.error(detail: "The socket has an invalid descriptor")
+		}
+
+		if status != .listening {
+			throw UniSocketError.error(detail: "The socket is not listening")
+		}
+
+		var socketfd2: Int32 = -1
+		// var address: Address? = nil
+    let clientSocket = try UniSocket(type: type, peer: peer)
+
+		var keepRunning: Bool = true
+		repeat {
+      let lenPtr: UnsafeMutablePointer<socklen_t> = withUnsafeMutablePointer(to: &clientSocket.peer_addrinfo.pointee.ai_addrlen) { $0 }
+      let fd = system_accept(fd, clientSocket.peer_addrinfo.pointee.ai_addr, lenPtr)
+      // guard let acceptAddress = try Address(addressProvider: { (addressPointer, addressLengthPointer) in
+      // 	#if os(Linux)
+      // 		let fd = Glibc.accept(self.socketfd, addressPointer, addressLengthPointer)
+      // 	#else
+      // 		let fd = Darwin.accept(self.socketfd, addressPointer, addressLengthPointer)
+      // 	#endif
+
+        if fd < 0 {
+
+          // The operation was interrupted, continue the loop...
+          if errno == EINTR {
+            continue
+            // throw OperationInterrupted.accept
+          }
+
+          throw UniSocketError.error(detail: "Socket accept failed: \(lastError())")
+        }
+        socketfd2 = fd
+      // }) else {
+      // 	throw Error(code: Socket.SOCKET_ERR_WRONG_PROTOCOL, reason: "Unable to determine incoming socket protocol family.")
+      // }
+      // address = acceptAddress
+
+			keepRunning = false
+		} while keepRunning
+
+    print("client socket: \(socketfd2), listen socket: \(fd)")
+    clientSocket.fd = socketfd2
+    clientSocket.status = .connected
+    clientSocket.FD_SET()
+
+    return clientSocket
+
+		// Create the new socket...
+		//	Note: The current socket continues to listen.
+		// let newSocket = try Socket(fd: socketfd2, remoteAddress: address!, path: self.signature?.path)
+
+    // Return the new socket...
+    // return newSocket
+  }
+
+  public func listen(backlog: Int32 = 1) throws -> Void {
+
+    if status != .connected {
+			throw UniSocketError.error(detail: "The socket is not connected")
+		}
+
+    let ret = system_listen(fd, backlog)
+    if ret != 0 {
+      let errstr = String(validatingUTF8: strerror(errno)) ?? "unknown error code"
+			throw UniSocketError.error(detail: "failed to attach socket to '\(peer)' (\(errstr))")
+    }
+
+    status = .listening
+  }
+
+  public func bind() throws -> Void {
+    guard status == .none else {
+			throw UniSocketError.error(detail: "socket is \(status)")
+		}
+		var rc: Int32
+		var errstr: String? = ""
+		var ai: UnsafeMutablePointer<addrinfo>? = peer_addrinfo
+		while ai != nil {
+			fd = system_socket(ai!.pointee.ai_family, ai!.pointee.ai_socktype, ai!.pointee.ai_protocol)
+			if fd == -1 {
+				ai = ai?.pointee.ai_next
+				continue
+			}
+			FD_SET()
+			// let flags = fcntl(fd, F_GETFL)
+			// if flags != -1, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 {
+				if type == .udp {
+					status = .stateless
+					return
+				}
+				rc = system_bind(fd, ai!.pointee.ai_addr, ai!.pointee.ai_addrlen)
+				if rc == 0 {
+					break
+				}
+				if errno != EINPROGRESS {
+					errstr = String(validatingUTF8: strerror(errno)) ?? "unknown error code"
+				} else if let e = waitFor(.connected) {
+					errstr = e
+				} else {
+					break
+				}
+			// } else {
+			// 	errstr = String(validatingUTF8: strerror(errno)) ?? "unknown error code"
+			// }
+			_ = system_close(fd)
+			fd = -1
+			ai = ai?.pointee.ai_next
+		}
+		if fd == -1 {
+			throw UniSocketError.error(detail: "failed to attach socket to '\(peer)' (\(errstr ?? ""))")
+		}
+		status = .connected
+  }
+
 	public func attach() throws -> Void {
 		guard status == .none else {
 			throw UniSocketError.error(detail: "socket is \(status)")
@@ -224,29 +362,55 @@ public class UniSocket {
 		status = .none
 	}
 
+  private func getTimeout(_ status: UniSocketStatus, _ timeout: UInt?) -> UInt? {
+    if let t = timeout {
+      return t
+    }
+
+    switch status {
+		case .connected: return self.timeout.connect
+		case .readable:  return self.timeout.read
+		case .writable:  return self.timeout.write
+		default:
+			return nil
+		}
+  }
+  // func _select(_ nfds: Int32, _ readfds: UnsafeMutablePointer<fd_set>!, _ writefds: UnsafeMutablePointer<fd_set>!, _ errorfds: UnsafeMutablePointer<fd_set>!, _ timeout: UInt?) -> Int32 {
+  //   var timer = timeval()
+  //   if let t = timeout {
+  //     timer.tv_sec = time_t(t)
+  //     return select(nfds, readfds, writefds, errorfds, &timer)
+  //   }
+  //   else {
+  //     return select(nfds, readfds, writefds, errorfds, nil)
+  //   }
+  // }
+
+  func _select(_ nfds: Int32, _ readfds: UnsafeMutablePointer<fd_set>!, _ writefds: UnsafeMutablePointer<fd_set>!, _ errorfds: UnsafeMutablePointer<fd_set>!, _ timeout: UInt?) -> Int32 {
+    var timer = timeval()
+    if let t = timeout {
+      timer.tv_sec = time_t(t)
+    }
+
+    return withUnsafeMutablePointer(to: &timer, { ptr in
+      let optionalTimeoutArg = timeout != nil ? ptr : nil
+      // print("select with timeout: \(optionalTimeoutArg)")
+      return select(nfds, readfds, writefds, errorfds, optionalTimeoutArg)
+    })
+  }
+
 	private func waitFor(_ status: UniSocketStatus, timeout: UInt? = nil) -> String? {
 		var rc: Int32
 		var fds = fdset
-		var timer = timeval()
-		if let t = timeout {
-			timer.tv_sec = time_t(t)
-		}
+    let t = getTimeout(status, timeout)
+
 		switch status {
 		case .connected:
-			if timeout == nil {
-				timer.tv_sec = time_t(self.timeout.connect)
-			}
-			rc = select(fd + 1, nil, &fds, nil, &timer)
+			rc = _select(fd + 1, nil, &fds, nil, t)
 		case .readable:
-			if timeout == nil {
-				timer.tv_sec = time_t(self.timeout.read)
-			}
-			rc = select(fd + 1, &fds, nil, nil, &timer)
+			rc = _select(fd + 1, &fds, nil, nil, t)
 		case .writable:
-			if timeout == nil {
-				timer.tv_sec = time_t(self.timeout.write)
-			}
-			rc = select(fd + 1, nil, &fds, nil, &timer)
+			rc = _select(fd + 1, nil, &fds, nil, t)
 		default:
 			return nil
 		}
